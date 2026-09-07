@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import csv
 import html as html_lib
 import ipaddress
 import logging
@@ -13,7 +14,7 @@ from pathlib import Path
 import bot as core
 from aiogram.types import FSInputFile, Message
 
-log = logging.getLogger("osint-bot.images")
+log = logging.getLogger("osint-bot.enhanced")
 IMG_SRC_RE = re.compile(r'(<img\b[^>]*?\bsrc=["\'])(https?://[^"\']+)(["\'])', re.IGNORECASE)
 MAX_IMAGE_BYTES = 3 * 1024 * 1024
 MAX_IMAGES = 30
@@ -50,17 +51,13 @@ def _public_http_url(url: str) -> bool:
 def _fetch_image(url: str) -> tuple[str, bytes] | None:
     opener = urllib.request.build_opener(NoRedirect())
     current = html_lib.unescape(url)
-
     for _ in range(MAX_REDIRECTS + 1):
         if not _public_http_url(current):
             return None
-        req = urllib.request.Request(
-            current,
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; OSINTBot/1.0)",
-                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-            },
-        )
+        req = urllib.request.Request(current, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; OSINTBot/1.0)",
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        })
         try:
             resp = opener.open(req, timeout=DOWNLOAD_TIMEOUT)
         except urllib.error.HTTPError as exc:
@@ -73,7 +70,6 @@ def _fetch_image(url: str) -> tuple[str, bytes] | None:
             return None
         except (urllib.error.URLError, TimeoutError, OSError):
             return None
-
         with resp:
             final_url = resp.geturl()
             if not _public_http_url(final_url):
@@ -96,7 +92,6 @@ def _embed_images_sync(report: Path) -> tuple[Path, int, int]:
     matches = list(IMG_SRC_RE.finditer(text))
     if not matches:
         return report, 0, 0
-
     cache: dict[str, str | None] = {}
     attempted = 0
     embedded = 0
@@ -110,20 +105,16 @@ def _embed_images_sync(report: Path) -> tuple[Path, int, int]:
                 embedded += 1
                 return f"{match.group(1)}{data_uri}{match.group(3)}"
             return match.group(0)
-
         if attempted >= MAX_IMAGES:
             cache[original_url] = None
             return match.group(0)
-
         attempted += 1
         fetched = _fetch_image(original_url)
         if not fetched:
             cache[original_url] = None
             return match.group(0)
-
         content_type, data = fetched
-        encoded = base64.b64encode(data).decode("ascii")
-        data_uri = f"data:{content_type};base64,{encoded}"
+        data_uri = f"data:{content_type};base64,{base64.b64encode(data).decode('ascii')}"
         cache[original_url] = data_uri
         embedded += 1
         return f"{match.group(1)}{data_uri}{match.group(3)}"
@@ -131,56 +122,92 @@ def _embed_images_sync(report: Path) -> tuple[Path, int, int]:
     updated = IMG_SRC_RE.sub(replace, text)
     if embedded == 0:
         return report, 0, attempted
-
     output = report.with_name(f"{report.stem}_with_images.html")
     output.write_text(updated, encoding="utf-8")
     return output, embedded, attempted
 
 
+def _sherlock_rows(csv_path: Path) -> list[dict[str, str]]:
+    if not csv_path.exists():
+        return []
+    rows = []
+    with csv_path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+        for row in csv.DictReader(fh):
+            exists = (row.get("exists") or "").upper()
+            url = (row.get("url_user") or "").strip()
+            if url and "CLAIMED" in exists:
+                rows.append({"site": (row.get("name") or "Site").strip(), "url": url})
+    return rows
+
+
+def _build_combined_report(username: str, maigret_report: Path, sherlock_rows: list[dict[str, str]]) -> Path:
+    maigret_html = maigret_report.read_text(encoding="utf-8", errors="replace")
+    items = "".join(
+        f'<li><strong>{html_lib.escape(row["site"])}</strong>: '
+        f'<a href="{html_lib.escape(row["url"], quote=True)}">{html_lib.escape(row["url"])}</a></li>'
+        for row in sherlock_rows
+    ) or "<li>Sherlock не добавил новых подтверждённых профилей.</li>"
+    block = (
+        '<section style="margin:24px 0;padding:18px;border:1px solid #ddd;border-radius:12px">'
+        f'<h2>Sherlock: найдено {len(sherlock_rows)}</h2><ul>{items}</ul></section>'
+    )
+    marker = re.search(r"<body[^>]*>", maigret_html, re.IGNORECASE)
+    if marker:
+        pos = marker.end()
+        combined = maigret_html[:pos] + block + maigret_html[pos:]
+    else:
+        combined = f"<html><body><h1>OSINT report for {html_lib.escape(username)}</h1>{block}{maigret_html}</body></html>"
+    output = maigret_report.with_name(f"{username}_combined.html")
+    output.write_text(combined, encoding="utf-8")
+    return output
+
+
 async def enhanced_execute_username(message: Message, username: str, access_label: str) -> bool:
     uid = message.from_user.id
-    job = core.OUT / f"maigret_{uid}_{int(core.time.time())}"
+    job = core.OUT / f"username_{uid}_{int(core.time.time())}"
     job.mkdir(parents=True, exist_ok=True)
-
     await message.answer(
-        f"{access_label} Ищу публичные профили для "
-        f"<code>{core.html.escape(username)}</code>.",
+        f"{access_label} Запускаю полный поиск <code>{core.html.escape(username)}</code> через Maigret + Sherlock.",
         parse_mode="HTML",
     )
 
     async with core.sem:
-        code, output = await core.run_cmd(
-            [
-                str(core.ROOT / "runtime" / "maigret" / "bin" / "python"),
-                "-m", "maigret", username,
-                "--no-progressbar", "--no-color",
-                "--folderoutput", str(job), "--html",
-            ],
-            core.ROOT,
-            uid,
-        )
+        maigret_task = asyncio.create_task(core.run_cmd([
+            str(core.ROOT / "runtime" / "maigret" / "bin" / "python"), "-m", "maigret", username,
+            "--no-progressbar", "--no-color", "--folderoutput", str(job / "maigret"), "--html",
+        ], core.ROOT, uid))
+        sherlock_csv = job / "sherlock.csv"
+        sherlock_task = asyncio.create_task(core.run_cmd([
+            str(core.ROOT / "runtime" / "sherlock" / "bin" / "sherlock"), username,
+            "--csv", "--output", str(sherlock_csv), "--no-color", "--print-found", "--timeout", "20",
+        ], core.ROOT, uid))
+        (m_code, m_output), (s_code, s_output) = await asyncio.gather(maigret_task, sherlock_task)
 
-    reports = list(job.glob("*.html"))
-    if code == 0 and reports:
-        report = max(reports, key=lambda x: x.stat().st_mtime)
-        try:
-            final_report, embedded, attempted = await asyncio.to_thread(_embed_images_sync, report)
-        except Exception:
-            log.exception("Failed to embed Maigret images")
-            final_report, embedded, attempted = report, 0, 0
+    reports = list((job / "maigret").glob("*.html")) if (job / "maigret").exists() else []
+    if m_code != 0 or not reports:
+        await message.answer(f"Maigret не завершил поиск, код {m_code}.")
+        await core.send_output(message, m_output)
+        return False
 
-        caption = f"Maigret: {username}"
-        if embedded:
-            caption += f" • встроено изображений: {embedded}"
-        elif attempted:
-            caption += " • внешние изображения недоступны, отправлен обычный отчёт"
+    report = max(reports, key=lambda x: x.stat().st_mtime)
+    rows = _sherlock_rows(sherlock_csv) if s_code == 0 else []
+    if s_code != 0:
+        log.warning("Sherlock failed for %s: %s", username, s_output[-1000:])
 
-        await message.answer_document(FSInputFile(final_report), caption=caption)
-        return True
+    combined = await asyncio.to_thread(_build_combined_report, username, report, rows)
+    try:
+        final_report, embedded, attempted = await asyncio.to_thread(_embed_images_sync, combined)
+    except Exception:
+        log.exception("Failed to embed report images")
+        final_report, embedded, attempted = combined, 0, 0
 
-    await message.answer(f"Maigret не смог завершить запрос, код {code}.")
-    await core.send_output(message, output)
-    return False
+    caption = f"Полный поиск: {username} • Sherlock: {len(rows)} профилей"
+    if embedded:
+        caption += f" • фото: {embedded}"
+    await message.answer_document(FSInputFile(final_report), caption=caption)
+    if s_code != 0:
+        await message.answer("Maigret завершён. Sherlock временно не ответил, поэтому отчёт содержит доступные результаты Maigret.")
+    return True
 
 
 core.execute_username = enhanced_execute_username
