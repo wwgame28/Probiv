@@ -14,10 +14,13 @@ import zipfile
 from pathlib import Path
 
 import bot as core
+from aiogram.filters import Command
 from aiogram.types import FSInputFile, Message
 
 log = logging.getLogger("osint-bot.enhanced")
 IMG_SRC_RE = re.compile(r'(<img\b[^>]*?\bsrc=["\'])(https?://[^"\']+)(["\'])', re.IGNORECASE)
+DOMAIN_RE = re.compile(r"(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}")
+PHONE_RE = re.compile(r"\+?[0-9][0-9 ()-]{7,20}")
 MAX_IMAGE_BYTES = 3 * 1024 * 1024
 MAX_IMAGES = 30
 MAX_REDIRECTS = 4
@@ -196,6 +199,64 @@ def _domain_summary_html(target: str, subdomains: list[str], spiderfoot_ok: bool
     )
 
 
+def _classify_query(value: str) -> tuple[str | None, str]:
+    raw = value.strip()
+    if raw.startswith("@"):
+        username = core.normalize_username(raw)
+        return ("username", username) if core.valid_username(username) else (None, raw)
+
+    if "://" in raw:
+        return ("scan", raw) if core.valid_target(raw) else (None, raw)
+
+    try:
+        ipaddress.ip_address(raw)
+        return ("scan", raw) if core.valid_target(raw) else (None, raw)
+    except ValueError:
+        pass
+
+    if DOMAIN_RE.fullmatch(raw):
+        return ("scan", raw) if core.valid_target(raw) else (None, raw)
+
+    username = core.normalize_username(raw)
+    if core.valid_username(username):
+        return "username", username
+    return None, raw
+
+
+async def unified_search_cmd(message: Message, bot) -> None:
+    if not core.allowed(message) or not message.from_user:
+        return
+    core.register_user(message.from_user)
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 1 or not parts[1].strip():
+        await message.answer(
+            "Одна команда для поиска:\n\n"
+            "/search @username\n"
+            "/search username\n"
+            "/search example.com\n"
+            "/search 8.8.8.8\n\n"
+            "Бот сам определит тип цели и запустит подходящие движки."
+        )
+        return
+
+    raw = parts[1].strip()
+    if PHONE_RE.fullmatch(raw):
+        await message.answer(
+            "Номер телефона распознан, но закрытые базы, утечки и приватные данные бот не использует. "
+            "Поиск по телефону будет добавлен только для законных открытых источников."
+        )
+        return
+
+    command, argument = _classify_query(raw)
+    if not command:
+        await message.answer(
+            "Не смог определить тип запроса. Поддерживаются username, домен, URL и публичный IP."
+        )
+        return
+
+    await core.handle_request(message, bot, command, argument)
+
+
 async def enhanced_execute_username(message: Message, username: str, access_label: str) -> bool:
     uid = message.from_user.id
     job = core.OUT / f"username_{uid}_{int(core.time.time())}"
@@ -315,6 +376,11 @@ async def enhanced_execute_scan(message: Message, target: str, access_label: str
 
 core.execute_username = enhanced_execute_username
 core.execute_scan = enhanced_execute_scan
+core.dp.message.register(unified_search_cmd, Command("search", "find", "osint"))
+# bot.py already has a catch-all message handler. Put the unified command first,
+# otherwise that catch-all would politely eat /search before it reaches us.
+if core.dp.message.handlers:
+    core.dp.message.handlers.insert(0, core.dp.message.handlers.pop())
 
 if __name__ == "__main__":
     asyncio.run(core.main())
