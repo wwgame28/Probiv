@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Keep SpiderFoot and Maigret isolated: their dependency ranges conflict.
+# Isolate OSINT engines because their dependency ranges can conflict.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
@@ -19,6 +19,9 @@ RUN python -m venv /app/runtime/bot \
  && python -m venv /app/runtime/maigret \
  && /app/runtime/maigret/bin/pip install --upgrade pip setuptools wheel \
  && /app/runtime/maigret/bin/pip install "maigret==0.6.5" \
+ && python -m venv /app/runtime/sherlock \
+ && /app/runtime/sherlock/bin/pip install --upgrade pip setuptools wheel \
+ && /app/runtime/sherlock/bin/pip install "sherlock-project==0.16.0" \
  && mkdir -p /app/vendor/spiderfoot \
  && curl -fsSL https://github.com/smicallef/spiderfoot/archive/refs/tags/v4.0.tar.gz \
     | tar -xz --strip-components=1 -C /app/vendor/spiderfoot \
