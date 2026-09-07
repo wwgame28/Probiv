@@ -27,7 +27,7 @@ RUN python -m venv /app/runtime/bot \
  && /app/runtime/spiderfoot/bin/pip install --upgrade pip setuptools wheel \
  && /app/runtime/spiderfoot/bin/pip install -r /app/vendor/spiderfoot/requirements.txt
 
-COPY bot.py README.md .env.example PROJECT.json /app/
+COPY bot.py main.py README.md .env.example PROJECT.json /app/
 RUN mkdir -p /app/data/reports
 
-CMD ["/app/runtime/bot/bin/python", "/app/bot.py"]
+CMD ["/app/runtime/bot/bin/python", "/app/main.py"]
